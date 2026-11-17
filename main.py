@@ -1,103 +1,104 @@
-from lxml import etree
-from lxml.etree import QName
-from decimal import Decimal
+"""Namizna aplikacija za pretvorbo REK-1b v REK-O."""
+import os
+from pathlib import Path
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from converter import convert_file
 
-# === Imena datotek ===
-rek1b_file = "reki (3).xml"
-rek_o_file = "converted RekO.xml"
+class ConverterApp:
+    def __init__(self, root):
+        self.root = root
+        self.source = None
+        self.result = None
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        root.title('XML pretvornik • REK-1b → REK-O')
+        root.geometry('720x430')
+        root.minsize(620, 400)
+        root.protocol('WM_DELETE_WINDOW', self.close)
+        frame = ttk.Frame(root, padding=28)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text='REK-1b → REK-O', font=('Segoe UI', 22, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text='Izberi XML datoteko, jo pretvori in shrani rezultat.').pack(anchor='w', pady=(6, 24))
+        self.open_button = ttk.Button(frame, text='1. Izberi XML datoteko …', command=self.select)
+        self.open_button.pack(anchor='w')
+        self.filename = tk.StringVar(value='Datoteka še ni izbrana.')
+        ttk.Label(frame, textvariable=self.filename, wraplength=620).pack(anchor='w', pady=(10, 20))
+        actions = ttk.Frame(frame)
+        actions.pack(anchor='w')
+        self.convert_button = ttk.Button(actions, text='2. Pretvori', command=self.convert, state='disabled')
+        self.convert_button.pack(side='left', padx=(0, 12))
+        self.save_button = ttk.Button(actions, text='3. Shrani kot …', command=self.save, state='disabled')
+        self.save_button.pack(side='left')
+        self.progress = ttk.Progressbar(frame, mode='indeterminate')
+        self.progress.pack(fill='x', pady=(24, 12))
+        self.status = tk.StringVar(value='Pripravljeno.')
+        ttk.Label(frame, textvariable=self.status, wraplength=620).pack(anchor='w')
+        ttk.Label(frame, text='Zneski se prenesejo iz starega obrazca brez seštevanja.\nVeljavnost po XSD shemi eDavki ni preverjena.', foreground='#555555').pack(anchor='w', pady=(20, 0))
 
-# === Namespace-i ===
-NS_REKO = "http://edavki.durs.si/Documents/Schemas/REK_O_1.xsd"
-NS_EDP = "http://edavki.durs.si/Documents/Schemas/EDP-Common-1.xsd"
-NS_ANALYTICAL = "http://edavki.durs.si/Documents/Schemas/REK_O_Analytical_1.xsd"
-NS_REK1B = {
-    "rek": "http://edavki.durs.si/Documents/Schemas/REK_1b_2.xsd",
-    "edp": NS_EDP,
-    "podo": "http://edavki.durs.si/Documents/Schemas/PODO-Common-1.xsd"
-}
+    def select(self):
+        path = filedialog.askopenfilename(title='Izberi vhodni REK-1b XML', filetypes=[('XML datoteke', '*.xml'), ('Vse datoteke', '*.*')])
+        if path:
+            self.source = Path(path)
+            self.result = None
+            self.filename.set(str(self.source))
+            self.convert_button.config(state='normal')
+            self.save_button.config(state='disabled')
+            self.status.set('Datoteka je izbrana. Klikni Pretvori.')
 
-def analytical_tag(tag):
-    return QName(NS_ANALYTICAL, tag)
+    def convert(self):
+        self.result = None
+        for button in (self.open_button, self.convert_button, self.save_button):
+            button.config(state='disabled')
+        self.progress.start()
+        self.status.set('Pretvarjam …')
+        self.future = self.executor.submit(convert_file, self.source)
+        self.root.after(100, self.poll)
 
-# === Branje vhodne XML ===
-parser = etree.XMLParser(remove_blank_text=True)
-tree = etree.parse(rek1b_file, parser)
-root = tree.getroot()
+    def poll(self):
+        if not self.future.done():
+            self.root.after(100, self.poll)
+            return
+        self.progress.stop()
+        self.open_button.config(state='normal')
+        self.convert_button.config(state='normal')
+        try:
+            self.result, count = self.future.result()
+        except Exception as exc:
+            self.status.set('Pretvorba ni uspela. Preveri vhodno datoteko.')
+            messagebox.showerror('Napaka pri pretvorbi', str(exc))
+        else:
+            self.save_button.config(state='normal')
+            self.status.set(f'Pretvorba je uspela. Število postavk: {count}. Rezultat lahko shraniš.')
 
-# === Osnovna struktura REK_O ===
-reko_root = etree.Element("Envelope", nsmap={
-    None: NS_REKO,
-    "edp": NS_EDP
-})
+    def save(self):
+        path = filedialog.asksaveasfilename(title='Shrani pretvorjeni REK-O', initialfile=self.source.stem + '_REK_O.xml', defaultextension='.xml', filetypes=[('XML datoteke', '*.xml')])
+        if not path:
+            return
+        destination = Path(path)
+        if destination.resolve() == self.source.resolve() or (destination.exists() and os.path.samefile(destination, self.source)):
+            messagebox.showerror('Izberi drugo ime', 'Izhodna datoteka ne sme prepisati vhodne datoteke.')
+            return
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as stream:
+                temporary = stream.name
+                stream.write(self.result)
+            os.replace(temporary, destination)
+        except OSError as exc:
+            messagebox.showerror('Napaka pri shranjevanju', str(exc))
+        else:
+            self.status.set(f'Shranjeno: {destination}')
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
-header = root.find("edp:Header", namespaces=NS_REK1B)
-reko_header = etree.SubElement(reko_root, QName(NS_EDP, "Header"))
-reko_header.append(header.find("edp:taxpayer", namespaces=NS_REK1B))
+    def close(self):
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.root.destroy()
 
-etree.SubElement(reko_root, QName(NS_EDP, "Signatures"))
-body = etree.SubElement(reko_root, "body")
-etree.SubElement(body, QName(NS_EDP, "bodyContent"))
-
-rek_elem = etree.SubElement(body, "REK")
-rek_o = etree.SubElement(rek_elem, "REK_O")
-
-rek1b = root.find(".//rek:REK_1b", namespaces=NS_REK1B)
-
-# === Glava REK_O ===
-etree.SubElement(rek_o, "DocumentType").text = "O"
-etree.SubElement(rek_o, "F004").text = "false"
-etree.SubElement(rek_o, "F008").text = rek1b.findtext("rek:F008_ResponsiblePerson", namespaces=NS_REK1B)
-etree.SubElement(rek_o, "F009").text = rek1b.findtext("rek:F009_PhoneNumber", namespaces=NS_REK1B).replace(" ", "")
-etree.SubElement(rek_o, "F010").text = "1096"
-etree.SubElement(rek_o, "F010a").text = "false"
-etree.SubElement(rek_o, "F011Start").text = rek1b.findtext("rek:F11_MonthYearStart", namespaces=NS_REK1B)
-etree.SubElement(rek_o, "F012").text = rek1b.findtext("rek:F12_PaymentDate", namespaces=NS_REK1B)
-
-# === AnalyticalData ===
-analytical = etree.Element(
-    QName(NS_ANALYTICAL, "AnalyticalData"),
-    nsmap={
-        None: NS_ANALYTICAL,
-        "edp": NS_EDP
-    }
-)
-rek_elem.append(analytical)
-
-sum_f401z = Decimal("0.00")
-sum_f402z = Decimal("0.00")
-
-# === Zanka čez zavezance ===
-for item in root.findall(".//podo:AnalyticalDataItem", namespaces=NS_REK1B):
-    new_item = etree.SubElement(analytical, analytical_tag("AnalyticalDataItem"))
-    etree.SubElement(new_item, analytical_tag("A001")).text = item.findtext("podo:A001", namespaces=NS_REK1B)
-    etree.SubElement(new_item, analytical_tag("A003")).text = item.findtext("podo:A003i", namespaces=NS_REK1B)
-    etree.SubElement(new_item, analytical_tag("A003a")).text = item.findtext("podo:A003p", namespaces=NS_REK1B)
-    etree.SubElement(new_item, analytical_tag("A004")).text = item.findtext("podo:A004", namespaces=NS_REK1B)
-
-    # Branje in pretvorba v decimal
-    a081 = Decimal(item.findtext("podo:A081SZ", "0", namespaces=NS_REK1B))
-    a082 = Decimal(item.findtext("podo:A082SZ", "0", namespaces=NS_REK1B))
-    a086 = a081 + a082
-
-    etree.SubElement(new_item, analytical_tag("A081O")).text = f"{a081:.2f}"
-    etree.SubElement(new_item, analytical_tag("A081P")).text = f"{a081:.2f}"
-    etree.SubElement(new_item, analytical_tag("A082O")).text = f"{a082:.2f}"
-    etree.SubElement(new_item, analytical_tag("A082P")).text = f"{a082:.2f}"
-    etree.SubElement(new_item, analytical_tag("A086O")).text = f"{a086:.2f}"
-    etree.SubElement(new_item, analytical_tag("A086P")).text = f"{a086:.2f}"
-
-    # Za glavo REK_O
-    sum_f401z += a081
-    sum_f402z += a082
-
-# === Zneski na račune ===
-etree.SubElement(rek_o, "F301R").text = "SI5601100-8882000003 SI19 79826989-44008"
-etree.SubElement(rek_o, "F301O").text = f"{sum_f401z:.2f}"
-etree.SubElement(rek_o, "F301P").text = f"{sum_f401z:.2f}"
-etree.SubElement(rek_o, "F302R").text = "SI5601100-8883000073 SI19 79826989-45004"
-etree.SubElement(rek_o, "F302O").text = f"{sum_f402z:.2f}"
-etree.SubElement(rek_o, "F302P").text = f"{sum_f402z:.2f}"
-
-# === Shrani v XML datoteko ===
-etree.ElementTree(reko_root).write(rek_o_file, pretty_print=True, xml_declaration=True, encoding="UTF-8")
-print(f"✅ Pretvorjeno: '{rek1b_file}' → '{rek_o_file}'")
+if __name__ == '__main__':
+    window = tk.Tk()
+    ConverterApp(window)
+    window.mainloop()
